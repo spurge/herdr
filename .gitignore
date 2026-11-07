@@ -1,0 +1,39 @@
+# Allowlist: ignore everything, then add back only what's ours.
+# Herdr rewrites its own files on every start (AGENTS.md, *.d.ts, frame/,
+# icons/, the shipped layouts, mods and themes), and keeps per-machine state
+# (view.json, shared.json, window.json, data/, layouts/.state/, telemetry/...).
+/*
+!/.gitignore
+!/README.md
+
+# The person: settings, keys, program table
+!/settings.json
+!/keys.json
+!/programs.json
+
+# Our layouts (and their preview pictures); not the shipped ones or .state/
+!/layouts/
+/layouts/*
+!/layouts/my-*.json
+!/layouts/my-*.svg
+
+# Themes: everything except the two Herdr ships
+!/themes/
+/themes/atom-one-dark.json
+/themes/win98.json
+
+# Our mods. Add new mod folders here.
+!/mods/
+/mods/*
+!/mods/my-*/
+!/mods/prs/
+# Written into every mod folder by Herdr
+/mods/**/gpui-kit.d.ts
+/mods/**/herdr.d.ts
+/mods/**/jsconfig.json
+
+# Error and backup files Herdr leaves next to the originals
+*.error
+*.reset-*
+*.old-*
+*.corrupt-*
