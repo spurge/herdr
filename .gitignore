@@ -27,6 +27,7 @@
 /mods/*
 !/mods/my-*/
 !/mods/prs/
+!/mods/issues/
 # Written into every mod folder by Herdr
 /mods/**/gpui-kit.d.ts
 /mods/**/herdr.d.ts

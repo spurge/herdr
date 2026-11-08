@@ -147,6 +147,13 @@
                       "content": {
                         "mod": "prs"
                       }
+                    },
+                    {
+                      "id": "issues",
+                      "type": "block",
+                      "content": {
+                        "mod": "issues"
+                      }
                     }
                   ],
                   "active": "files"
@@ -190,5 +197,6 @@
   "traffic_lights": [
     12,
     16
-  ]
+  ],
+  "preview": "layouts/my-main.svg"
 }

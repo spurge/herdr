@@ -56,15 +56,16 @@ async function resolve(cwd, on) {
   const top = await exec("git", ["rev-parse", "--show-toplevel"], { cwd, on });
   if (top.code !== 0) return { error: "Not a git repository" };
   const root = top.stdout.trim();
-  let remote = await exec("git", ["remote", "get-url", "origin"], { cwd: root, on });
+  let remoteName = "origin", remote = await exec("git", ["remote", "get-url", remoteName], { cwd: root, on });
   if (remote.code !== 0) {
     const names = await exec("git", ["remote"], { cwd: root, on });
-    const name = names.stdout.split("\n").find(Boolean);
-    if (!name) return { root, error: "This repository has no remote" };
-    remote = await exec("git", ["remote", "get-url", name], { cwd: root, on });
+    remoteName = names.stdout.split("\n").find(Boolean);
+    if (!remoteName) return { root, error: "This repository has no remote" };
+    remote = await exec("git", ["remote", "get-url", remoteName], { cwd: root, on });
   }
   const repo = parseRemote(remote.stdout);
   if (!repo) return { root, error: `Can't read the remote ${remote.stdout.trim()}` };
+  repo.remote = remoteName;
   let logins = [];
   try {
     const r = await exec("tea", ["logins", "list", "-o", "json"], { on });
@@ -84,7 +85,7 @@ async function list(repo, filter, on) {
       num: Number(p.index), title: p.title, author: p.author, url: p.url, head: p.head, base: p.base, updated: p.updated,
       state: p.state, draft: /^(wip:|\[wip\])/i.test(p.title), review: "", body: p.body ?? "",
       ci: p.ci === "error" ? "failure" : p.ci === "success" || p.ci === "failure" || p.ci === "pending" ? p.ci : "",
-      labels: (p.labels || "").split(",").map((s) => s.trim()).filter(Boolean),
+      labels: (p.labels || "").split(/[\s,]+/).filter(Boolean),
     }));
   }
   let r;
@@ -116,31 +117,35 @@ export default class Prs extends View {
 
   view() { return `${this.context}|${this.filter}`; }
 
-  refresh(cx, force) {
+  // force: fetch even if nothing changed; rescan: also look at the repo's remote and tea logins again.
+  refresh(cx, force, rescan) {
     const { cwd, on } = location(), context = key();
     if (context !== this.context) {
       this.context = context; this.selected = null; this.note = null;
       const hit = this.cache.get(this.view());
       this.repo = hit?.repo ?? null; this.prs = hit?.prs ?? []; this.error = hit?.error ?? null; this.at = hit?.at ?? 0;
-      if (hit && Date.now() - hit.at < 60000) return;
+      // While the panel is closed, wait: render fetches once it shows (`at` is stale).
+      if (!visible() || (hit && Date.now() - hit.at < 60000)) return;
     } else if (!force) return;
     if (!cwd || this.loading) return;
     this.loading = true;
-    const view = this.view();
+    const view = this.view(), filter = this.filter, known = this.repo;
+    const reuse = !rescan && known?.root && !known.error && (cwd === known.root || cwd.startsWith(known.root + "/"));
     cx.spawn(async (cx) => {
-      let entry;
+      let entry, repo = reuse ? known : null;
       try {
-        const repo = this.repo && this.repo.root && cwd.startsWith(this.repo.root) ? this.repo : await resolve(cwd, on);
+        repo = repo ?? await resolve(cwd, on);
         if (repo.error) entry = { repo, prs: [], error: repo.error };
         else {
-          const prs = (await list(repo, this.filter, on)).sort((a, b) => Date.parse(b.updated) - Date.parse(a.updated));
+          const prs = (await list(repo, filter, on)).sort((a, b) => Date.parse(b.updated) - Date.parse(a.updated));
           entry = { repo, prs, error: null };
         }
-      } catch (e) { entry = { repo: this.repo, prs: [], error: String(e.message ?? e) }; }
+      } catch (e) { entry = { repo, prs: [], error: String(e.message ?? e) }; }
       finally { this.loading = false; }
       entry.at = Date.now();
       this.cache.set(view, entry);
       if (this.view() === view) { this.repo = entry.repo; this.prs = entry.prs; this.error = entry.error; this.at = entry.at; }
+      else if (visible()) this.refresh(cx, true); // the folder or filter changed while loading
       cx.notify();
     });
     cx.notify();
@@ -150,7 +155,7 @@ export default class Prs extends View {
     if (filter === this.filter) return;
     this.filter = filter; localStorage.setItem("filter", filter); this.selected = null;
     const hit = this.cache.get(this.view());
-    this.prs = hit?.prs ?? []; this.error = hit?.error ?? null;
+    this.prs = hit?.prs ?? []; this.error = hit?.error ?? null; this.at = hit?.at ?? 0;
     this.refresh(cx, true);
   }
 
@@ -181,7 +186,7 @@ export default class Prs extends View {
     const repo = this.repo;
     if (!repo) return;
     const how = repo.tool === "tea"
-      ? `Read it with \`tea pr ${pr.num} --login ${repo.login} --repo ${repo.slug}\`, and get the diff with \`git fetch origin pull/${pr.num}/head && git diff origin/${pr.base}...FETCH_HEAD\`.`
+      ? `Read it with \`tea pr ${pr.num} --login ${repo.login} --repo ${repo.slug}\`, and get the diff with \`git fetch ${repo.remote} pull/${pr.num}/head && git diff ${repo.remote}/${pr.base}...FETCH_HEAD\`.`
       : `Read it with \`gh pr view ${pr.num} --repo ${repo.host}/${repo.slug}\` and \`gh pr diff ${pr.num} --repo ${repo.host}/${repo.slug}\`.`;
     run("tab.new", { name: `PR #${pr.num}`, folder: repo.root, argv: ["claude"],
       task: `Review pull request #${pr.num} "${pr.title}" (${pr.url}). ${how} Summarize what it changes, then list anything that looks wrong or risky. Don't post comments or change anything.` });
@@ -267,7 +272,7 @@ export default class Prs extends View {
         .when(!pr && this.prs.length > 0, (el) => el.child(div().px(5).py(1).rounded(4).border_1().border_color(t.border).text_size(10).text_color(t.muted).flex_none().child(String(this.prs.length))))
         .child(div().flex_1().min_w(0).truncate().text_right().text_size(12).text_color(t.dim).child(repo?.slug ? `${repo.site} · ${repo.slug}` : ""))
         .child(div().id("prs-refresh").size(22).flex_none().flex().items_center().justify_center().rounded(6).cursor_pointer().text_color(t.muted).hover((s) => s.bg(t.hover))
-          .on_click((_e, cx) => this.refresh(cx, true))
+          .on_click((_e, cx) => this.refresh(cx, true, true))
           .child(this.loading ? svg("mods/workspace-chrome/spinner.svg").size(12).text_color(t.muted).spin(900) : "↻")))
       .when(Boolean(pr), (el) => el.child(this.detail(pr, t)))
       .when(!pr, (el) => el

@@ -14,9 +14,9 @@ const LANG = { ts: "js", tsx: "js", mts: "js", cts: "js", jsx: "js", mjs: "js", 
 const PER_FOLDER = 500, TOTAL = 5000;
 const MARKDOWN = /\.(md|markdown|mdx)$/i;
 
-// "../docs/x.md#part" from "notes/a.md" -> "docs/x.md"
+// "../docs/x.md#part" from "notes/a.md" -> "docs/x.md"; "/docs/x.md" starts at the folder's root, as on GitHub.
 function relative(from, href) {
-  const parts = from.split("/").slice(0, -1);
+  const parts = href.startsWith("/") ? [] : from.split("/").slice(0, -1);
   for (const seg of href.split(/[?#]/)[0].split("/")) {
     if (seg === "..") parts.pop(); else if (seg && seg !== ".") parts.push(decodeURIComponent(seg));
   }
