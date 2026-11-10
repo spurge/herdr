@@ -118,7 +118,8 @@ export default class Prs extends View {
   view() { return `${this.context}|${this.filter}`; }
 
   // force: fetch even if nothing changed; rescan: also look at the repo's remote and tea logins again.
-  refresh(cx, force, rescan) {
+  // From render, `rendering` is true: render already draws the new state, and notify() there throws.
+  refresh(cx, force, rescan, rendering) {
     const { cwd, on } = location(), context = key();
     if (context !== this.context) {
       this.context = context; this.selected = null; this.note = null;
@@ -148,7 +149,7 @@ export default class Prs extends View {
       else if (visible()) this.refresh(cx, true); // the folder or filter changed while loading
       cx.notify();
     });
-    cx.notify();
+    if (!rendering) cx.notify();
   }
 
   setFilter(filter, cx) {
@@ -190,6 +191,13 @@ export default class Prs extends View {
       : `Read it with \`gh pr view ${pr.num} --repo ${repo.host}/${repo.slug}\` and \`gh pr diff ${pr.num} --repo ${repo.host}/${repo.slug}\`.`;
     run("tab.new", { name: `PR #${pr.num}`, folder: repo.root, argv: ["claude"],
       task: `Review pull request #${pr.num} "${pr.title}" (${pr.url}). ${how} Summarize what it changes, then list anything that looks wrong or risky. Don't post comments or change anything.` });
+  }
+
+  // Skills from ~/src/claude-config: /review-pr, /ci-green, /pr-digest.
+  skill(name, task) {
+    const repo = this.repo;
+    if (!repo) return;
+    run("tab.new", { name, folder: repo.root, argv: ["claude"], task });
   }
 
   badge(text, color, t) {
@@ -247,7 +255,9 @@ export default class Prs extends View {
       .child(h_flex().gap(6).flex_wrap()
         .child(this.action("pr-open", "Open in browser", () => this.openUrl(pr.url), t, true))
         .when(pr.state === "open", (el) => el.child(this.action("pr-checkout", this.busy ? "Checking out…" : "Check out", (_e, cx) => this.checkout(pr, cx), t)))
-        .child(this.action("pr-review", "Review with Claude", () => this.review(pr), t)))
+        .child(this.action("pr-review", "Review with Claude", () => this.review(pr), t))
+        .when(pr.state === "open", (el) => el.child(this.action("pr-review-fix", "Review & fix", () => this.skill(`Fix #${pr.num}`, `/review-pr ${pr.num}`), t)))
+        .when(pr.state === "open" && (pr.ci === "failure" || pr.ci === "pending"), (el) => el.child(this.action("pr-ci-green", "Get CI green", () => this.skill(`CI #${pr.num}`, `/ci-green ${pr.num}`), t))))
       .when(Boolean(this.note), (el) => el.child(div().text_size(12).text_color(this.note.ok ? t.ansi2 : t.ansi1).child(this.note.text)))
       .child(div().h(1).flex_none().bg(t.border))
       .child(pr.body.trim()
@@ -256,8 +266,8 @@ export default class Prs extends View {
   }
 
   render(cx) {
-    if (key() !== this.context) this.refresh(cx);
-    else if (visible() && !this.loading && Date.now() - (this.at || 0) > 90000) this.refresh(cx, true);
+    if (key() !== this.context) this.refresh(cx, false, false, true);
+    else if (visible() && !this.loading && Date.now() - (this.at || 0) > 90000) this.refresh(cx, true, false, true);
     const t = theme(), repo = this.repo;
     const pr = this.selected !== null ? this.prs.find((p) => p.num === this.selected) : null;
     const tab = (id, label) => div().id(`prs-filter-${id}`).h(24).px(9).flex().items_center().rounded(6).text_size(12).cursor_pointer()
@@ -276,7 +286,10 @@ export default class Prs extends View {
           .child(this.loading ? svg("mods/workspace-chrome/spinner.svg").size(12).text_color(t.muted).spin(900) : "↻")))
       .when(Boolean(pr), (el) => el.child(this.detail(pr, t)))
       .when(!pr, (el) => el
-        .child(h_flex().flex_none().px(10).py(6).gap(4).border_b(1).border_color(t.border).child(tab("open", "Open")).child(tab("all", "Recent")))
+        .child(h_flex().flex_none().px(10).py(6).gap(4).border_b(1).border_color(t.border).child(tab("open", "Open")).child(tab("all", "Recent"))
+          .child(div().flex_1())
+          .when(Boolean(repo), (el) => el.child(div().id("prs-digest").h(24).px(9).flex().items_center().rounded(6).text_size(12).cursor_pointer()
+            .text_color(t.muted).hover((s) => s.bg(t.hover)).on_click(() => this.skill("PR digest", "/pr-digest")).child("Digest"))))
         .child(v_flex().id("prs-list").flex_1().min_h(0).overflow_y_scrollbar().p(6).gap(1)
           .children(this.prs.map((p) => this.row(p, t)))
           .when(!this.prs.length, (el) => el.child(div().p(8).text_size(12).text_color(this.error ? t.ansi1 : t.dim).child(empty)))

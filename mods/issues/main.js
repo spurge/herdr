@@ -123,7 +123,8 @@ export default class Issues extends View {
   view() { return `${this.context}|${this.filter}`; }
 
   // force: fetch even if nothing changed; rescan: also look at the repo's remote and tea logins again.
-  refresh(cx, force, rescan) {
+  // From render, `rendering` is true: render already draws the new state, and notify() there throws.
+  refresh(cx, force, rescan, rendering) {
     const { cwd, on } = location(), context = key();
     if (context !== this.context) {
       this.context = context; this.selected = null;
@@ -153,7 +154,7 @@ export default class Issues extends View {
       else if (visible()) this.refresh(cx, true); // the folder or filter changed while loading
       cx.notify();
     });
-    cx.notify();
+    if (!rendering) cx.notify();
   }
 
   setFilter(filter, cx) {
@@ -238,8 +239,8 @@ export default class Issues extends View {
   }
 
   render(cx) {
-    if (key() !== this.context) this.refresh(cx);
-    else if (visible() && !this.loading && Date.now() - (this.at || 0) > 90000) this.refresh(cx, true);
+    if (key() !== this.context) this.refresh(cx, false, false, true);
+    else if (visible() && !this.loading && Date.now() - (this.at || 0) > 90000) this.refresh(cx, true, false, true);
     const t = theme(), repo = this.repo;
     const issue = this.selected !== null ? this.issues.find((i) => i.num === this.selected) : null;
     const tab = (id, label) => div().id(`issues-filter-${id}`).h(24).px(9).flex().items_center().rounded(6).text_size(12).cursor_pointer()
