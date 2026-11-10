@@ -52,6 +52,53 @@ function rollup(checks) {
 
 const lastLine = (text) => (text || "").trim().split("\n").filter(Boolean).pop() || "";
 
+const STYLE_LABEL = { merge: "Merge commit", squash: "Squash and merge", rebase: "Rebase and merge",
+  "rebase-merge": "Rebase, then merge commit", "fast-forward-only": "Fast-forward" };
+
+// The merge styles the repository allows, its default first. GitHub's default is the one this
+// person last used there (viewerDefaultMergeMethod); Gitea's is the repo's default_merge_style.
+async function mergeStyles(repo, on) {
+  let allowed, first;
+  if (repo.tool === "tea") {
+    const r = await exec("tea", ["api", "--login", repo.login, `repos/${repo.slug}`], { cwd: repo.root, on });
+    let s = {};
+    try { s = JSON.parse(r.stdout || "{}"); } catch { /* reported below */ }
+    if (r.code !== 0 || !s.full_name) throw new Error(s.message || lastLine(r.stderr || r.stdout) || "Can't read the repository's merge settings");
+    first = s.default_merge_style;
+    allowed = [s.allow_merge_commits && "merge", s.allow_squash_merge && "squash", s.allow_rebase && "rebase",
+      first === "rebase-merge" && s.allow_rebase_explicit && "rebase-merge",
+      first === "fast-forward-only" && s.allow_fast_forward_only_merge && "fast-forward-only"].filter(Boolean);
+  } else {
+    const r = await exec("gh", ["repo", "view", `${repo.host}/${repo.slug}`, "--json",
+      "mergeCommitAllowed,squashMergeAllowed,rebaseMergeAllowed,viewerDefaultMergeMethod"], { cwd: repo.root, on });
+    if (r.code !== 0) throw new Error(lastLine(r.stderr || r.stdout) || "gh failed");
+    const s = JSON.parse(r.stdout || "{}");
+    first = (s.viewerDefaultMergeMethod || "").toLowerCase();
+    allowed = [s.mergeCommitAllowed && "merge", s.squashMergeAllowed && "squash", s.rebaseMergeAllowed && "rebase"].filter(Boolean);
+  }
+  if (!allowed.length) throw new Error("The repository allows no merge style");
+  return allowed.includes(first) ? [first, ...allowed.filter((x) => x !== first)] : allowed;
+}
+
+// Merges and deletes the head branch. gh with --repo leaves local branches alone.
+async function merge(repo, pr, style, on) {
+  if (repo.tool === "tea") {
+    // tea api exits 0 on HTTP errors: -i writes the status line to stderr.
+    const r = await exec("tea", ["api", "-i", "--login", repo.login, "-X", "POST", `repos/${repo.slug}/pulls/${pr.num}/merge`,
+      "-d", JSON.stringify({ Do: style, delete_branch_after_merge: true })], { cwd: repo.root, on, timeout: 120000 });
+    const status = Number(/HTTP\/\S+\s+(\d+)/.exec(r.stderr || "")?.[1] ?? 0);
+    if (r.code === 0 && status >= 200 && status < 300) return;
+    let msg = "";
+    try { msg = JSON.parse(r.stdout).message ?? ""; } catch { /* not JSON */ }
+    throw new Error(msg || (status ? `Gitea answered ${status}` : lastLine(r.stderr || r.stdout) || "Merge failed"));
+  }
+  const flag = { merge: "--merge", squash: "--squash", rebase: "--rebase" }[style];
+  const args = ["pr", "merge", String(pr.num), "--repo", `${repo.host}/${repo.slug}`, flag, "--delete-branch"];
+  if (pr.sha) args.push("--match-head-commit", pr.sha); // refuse if someone pushed since the list was read
+  const r = await exec("gh", args, { cwd: repo.root, on, timeout: 120000 });
+  if (r.code !== 0) throw new Error(lastLine(r.stderr || r.stdout) || "Merge failed");
+}
+
 async function resolve(cwd, on) {
   const top = await exec("git", ["rev-parse", "--show-toplevel"], { cwd, on });
   if (top.code !== 0) return { error: "Not a git repository" };
@@ -79,19 +126,21 @@ async function resolve(cwd, on) {
 async function list(repo, filter, on) {
   if (repo.tool === "tea") {
     const r = await exec("tea", ["pulls", "list", "--login", repo.login, "--repo", repo.slug, "--state", filter === "open" ? "open" : "all",
-      "--limit", "40", "--fields", "index,state,author,url,title,head,base,updated,labels,ci,body", "-o", "json"], { cwd: repo.root, on });
+      "--limit", "40", "--fields", "index,state,author,url,title,head,base,updated,labels,ci,body,mergeable", "-o", "json"], { cwd: repo.root, on });
     if (r.code !== 0) throw new Error(lastLine(r.stderr || r.stdout) || "tea failed");
     return JSON.parse(r.stdout || "[]").map((p) => ({
       num: Number(p.index), title: p.title, author: p.author, url: p.url, head: p.head, base: p.base, updated: p.updated,
       state: p.state, draft: /^(wip:|\[wip\])/i.test(p.title), review: "", body: p.body ?? "",
       ci: p.ci === "error" ? "failure" : p.ci === "success" || p.ci === "failure" || p.ci === "pending" ? p.ci : "",
       labels: (p.labels || "").split(/[\s,]+/).filter(Boolean),
+      // Gitea's mergeable only means no conflicts; also wait for green (or no) CI.
+      mergeable: p.state === "open" && p.mergeable === "true" && !/^(wip:|\[wip\])/i.test(p.title) && (p.ci === "success" || !p.ci),
     }));
   }
   let r;
   try {
     r = await exec("gh", ["pr", "list", "--repo", `${repo.host}/${repo.slug}`, "--state", filter === "open" ? "open" : "all", "--limit", "40",
-      "--json", "number,title,author,url,headRefName,baseRefName,updatedAt,isDraft,reviewDecision,statusCheckRollup,labels,state,body"], { cwd: repo.root, on });
+      "--json", "number,title,author,url,headRefName,headRefOid,baseRefName,updatedAt,isDraft,reviewDecision,statusCheckRollup,labels,state,body,mergeStateStatus"], { cwd: repo.root, on });
   } catch {
     throw new Error("gh isn't installed here. Install it with `brew install gh`, then run `gh auth login`.");
   }
@@ -103,7 +152,9 @@ async function list(repo, filter, on) {
   return JSON.parse(r.stdout || "[]").map((p) => ({
     num: p.number, title: p.title, author: p.author?.login ?? "", url: p.url, head: p.headRefName, base: p.baseRefName, updated: p.updatedAt,
     state: (p.state || "").toLowerCase(), draft: p.isDraft, review: p.reviewDecision || "", body: p.body ?? "",
-    ci: rollup(p.statusCheckRollup), labels: (p.labels ?? []).map((l) => l.name),
+    ci: rollup(p.statusCheckRollup), labels: (p.labels ?? []).map((l) => l.name), sha: p.headRefOid,
+    // CLEAN: no conflicts, required checks and reviews pass. HAS_HOOKS: the same, with pre-receive hooks.
+    mergeable: p.state === "OPEN" && !p.isDraft && (p.mergeStateStatus === "CLEAN" || p.mergeStateStatus === "HAS_HOOKS"),
   }));
 }
 
@@ -122,7 +173,7 @@ export default class Prs extends View {
   refresh(cx, force, rescan, rendering) {
     const { cwd, on } = location(), context = key();
     if (context !== this.context) {
-      this.context = context; this.selected = null; this.note = null;
+      this.context = context; this.selected = null; this.note = null; this.confirm = null;
       const hit = this.cache.get(this.view());
       this.repo = hit?.repo ?? null; this.prs = hit?.prs ?? []; this.error = hit?.error ?? null; this.at = hit?.at ?? 0;
       // While the panel is closed, wait: render fetches once it shows (`at` is stale).
@@ -154,7 +205,7 @@ export default class Prs extends View {
 
   setFilter(filter, cx) {
     if (filter === this.filter) return;
-    this.filter = filter; localStorage.setItem("filter", filter); this.selected = null;
+    this.filter = filter; localStorage.setItem("filter", filter); this.selected = null; this.confirm = null;
     const hit = this.cache.get(this.view());
     this.prs = hit?.prs ?? []; this.error = hit?.error ?? null; this.at = hit?.at ?? 0;
     this.refresh(cx, true);
@@ -183,6 +234,49 @@ export default class Prs extends View {
     cx.notify();
   }
 
+  // First click: show the repo's merge styles to pick from. Nothing merges until one is picked.
+  askMerge(pr, cx) {
+    const repo = this.repo, { on } = location();
+    if (!repo) return;
+    this.confirm = pr.num; this.note = null;
+    if (!repo.styles && !this.loadingStyles) {
+      this.loadingStyles = true;
+      cx.spawn(async (cx) => {
+        try { repo.styles = await mergeStyles(repo, on); }
+        catch (e) { this.confirm = null; this.note = { ok: false, text: String(e.message ?? e) }; }
+        finally { this.loadingStyles = false; cx.notify(); }
+      });
+    }
+    cx.notify();
+  }
+
+  merge(pr, style, cx) {
+    const repo = this.repo, { on } = location();
+    if (!repo || this.merging) return;
+    this.merging = true; this.note = null;
+    cx.spawn(async (cx) => {
+      try {
+        await merge(repo, pr, style, on);
+        pr.state = "merged"; pr.mergeable = false; this.confirm = null;
+        this.note = { ok: true, text: `Merged #${pr.num} into ${pr.base} and deleted ${pr.head}` };
+      } catch (e) { this.note = { ok: false, text: String(e.message ?? e) }; }
+      finally { this.merging = false; cx.notify(); }
+    });
+    cx.notify();
+  }
+
+  mergeBox(pr, t) {
+    const styles = this.repo?.styles;
+    const body = this.merging ? div().text_color(t.muted).child("Merging…")
+      : !styles ? div().text_color(t.muted).child("Reading the repository's merge settings…")
+      : h_flex().gap(6).flex_wrap()
+        .children(styles.map((s, i) => this.action(`pr-merge-${s}`, STYLE_LABEL[s] ?? s, (_e, cx) => this.merge(pr, s, cx), t, i === 0)))
+        .child(this.action("pr-merge-cancel", "Cancel", (_e, cx) => { this.confirm = null; cx.notify(); }, t));
+    return v_flex().p(10).gap(8).rounded(8).border_1().border_color(t.border).text_size(12)
+      .child(div().text_color(t.foreground).child(`Merge #${pr.num} into ${pr.base} and delete ${pr.head}?`))
+      .child(body);
+  }
+
   review(pr) {
     const repo = this.repo;
     if (!repo) return;
@@ -193,7 +287,7 @@ export default class Prs extends View {
       task: `Review pull request #${pr.num} "${pr.title}" (${pr.url}). ${how} Summarize what it changes, then list anything that looks wrong or risky. Don't post comments or change anything.` });
   }
 
-  // Skills from ~/src/claude-config: /review-pr, /ci-green, /pr-digest.
+  // Skills from ~/src/claude: /review-pr, /ci-green, /pr-digest.
   skill(name, task) {
     const repo = this.repo;
     if (!repo) return;
@@ -220,7 +314,7 @@ export default class Prs extends View {
   row(pr, t) {
     const state = this.status(pr, t);
     return v_flex().id(`pr-${pr.num}`).flex_none().px(8).py(7).gap(3).rounded(7).cursor_pointer().hover((s) => s.bg(t.hover))
-      .on_click((_e, cx) => { this.selected = pr.num; this.note = null; cx.notify(); })
+      .on_click((_e, cx) => { this.selected = pr.num; this.note = null; this.confirm = null; cx.notify(); })
       .child(h_flex().gap(8).items_center().min_w(0)
         .child(this.ciMark(pr, t))
         .child(div().flex_1().min_w(0).truncate().text_color(pr.draft || state ? t.muted : t.foreground).child(pr.title))
@@ -254,10 +348,12 @@ export default class Prs extends View {
         .children(pr.labels.map((l) => this.badge(l, t.muted, t))))
       .child(h_flex().gap(6).flex_wrap()
         .child(this.action("pr-open", "Open in browser", () => this.openUrl(pr.url), t, true))
+        .when(pr.mergeable && this.confirm !== pr.num, (el) => el.child(this.action("pr-merge", "Merge…", (_e, cx) => this.askMerge(pr, cx), t)))
         .when(pr.state === "open", (el) => el.child(this.action("pr-checkout", this.busy ? "Checking out…" : "Check out", (_e, cx) => this.checkout(pr, cx), t)))
         .child(this.action("pr-review", "Review with Claude", () => this.review(pr), t))
         .when(pr.state === "open", (el) => el.child(this.action("pr-review-fix", "Review & fix", () => this.skill(`Fix #${pr.num}`, `/review-pr ${pr.num}`), t)))
         .when(pr.state === "open" && (pr.ci === "failure" || pr.ci === "pending"), (el) => el.child(this.action("pr-ci-green", "Get CI green", () => this.skill(`CI #${pr.num}`, `/ci-green ${pr.num}`), t))))
+      .when(this.confirm === pr.num && pr.mergeable, (el) => el.child(this.mergeBox(pr, t)))
       .when(Boolean(this.note), (el) => el.child(div().text_size(12).text_color(this.note.ok ? t.ansi2 : t.ansi1).child(this.note.text)))
       .child(div().h(1).flex_none().bg(t.border))
       .child(pr.body.trim()
@@ -277,7 +373,7 @@ export default class Prs extends View {
 
     return v_flex().id("prs").size_full().min_h(0).rounded(10).overflow_hidden().bg(t.background).border_1().border_color(t.border).text_color(t.foreground).text_size(13)
       .child(h_flex().h(42).flex_none().px(14).gap(8).items_center().border_b(1).border_color(t.border)
-        .when(Boolean(pr), (el) => el.child(div().id("prs-back").w(20).cursor_pointer().text_color(t.muted).on_click((_e, cx) => { this.selected = null; this.note = null; cx.notify(); }).child("←")))
+        .when(Boolean(pr), (el) => el.child(div().id("prs-back").w(20).cursor_pointer().text_color(t.muted).on_click((_e, cx) => { this.selected = null; this.note = null; this.confirm = null; cx.notify(); }).child("←")))
         .child(div().font_semibold().flex_none().child("Pull requests"))
         .when(!pr && this.prs.length > 0, (el) => el.child(div().px(5).py(1).rounded(4).border_1().border_color(t.border).text_size(10).text_color(t.muted).flex_none().child(String(this.prs.length))))
         .child(div().flex_1().min_w(0).truncate().text_right().text_size(12).text_color(t.dim).child(repo?.slug ? `${repo.site} · ${repo.slug}` : ""))
